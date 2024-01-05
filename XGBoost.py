@@ -1,3 +1,4 @@
+from sklearn.model_selection import KFold
 import numpy as np
 from collections import deque
 
@@ -14,42 +15,80 @@ class XGBoostNode:
         self.indices = [] if indices is None else indices
         self.output_val = output_val
 
+    def __str__(self):
+        return f"Split Value:{self.split_value}"
+
 
 class XGBoostRegression:
 
     # Predict the residuals of the previous tree
 
-    def __init__(self, gamma: float = 0.5, lmbda: float = 1.0, max_depth: int = 4, max_leaves: int = 4) -> None:
+    def __init__(self, learning_rate: float = 0.1, gamma: float = 50, lmbda: float = 1.0, max_depth: int = 4, max_leaves: int = 4, n_trees: int = 4) -> None:
         self.lmbda = lmbda
         self.max_depth = max_depth
+        self.n_trees = n_trees
+        self.learning_rate = learning_rate
+        self.max_leaves = max_leaves
+        self.gamma = gamma
+        self.trees = []
 
     def fit(self, X, y):
         self.X = X
         self.y = y
+        self.initial_guess = np.mean(y)
+
+    def predict(self, X):
+        # Aggregate predictions from all trees
+        predictions = np.full(len(X), self.initial_guess)
+        for tree in self.trees:
+            for i, data_point in enumerate(X):
+                predictions[i] += self._traverse_tree(tree, data_point)
+        return predictions
 
     def train(self, X, y):
-        # calculate initial guess (mean of the target)
-        intial_guess = np.mean(y)
+        # Calculate initial residuals
+        residuals = y - self.initial_guess
 
-        # calc initial residuals
-        residuals = y - intial_guess
-
-        # loop to create n trees
+        # Loop to create n trees
+        next_guesses = residuals
         for tree_i in range(self.n_trees):
+            # Create the tree
+            new_tree = self._build_tree(residuals)
 
-            # create the tree
-            self._build_tree()
+            # Save the tree
+            self.trees.append(new_tree)
 
-            # get new predictions
+            # Update predictions and residuals
+            for i in range(len(X)):
+                prediction = self.learning_rate*self._traverse_tree(
+                    new_tree, X[i]) + next_guesses[i]
+                residuals[i] = y[i] - prediction
 
-            # compute the new residuals
-            residuals = None
+            # Update the initial guess for the next tree
+            next_guesses = residuals
 
-            # save the new residuals
+    def _prune_tree(self, node, residuals):
+        # Base case: if the node is a leaf
+        if node.left is None and node.right is None:
+            return self._calc_similarity_score(residuals[node.indices])
 
-            pass
+        # Recursively prune the left and right subtrees
+        left_gain = self._prune_tree(node.left, residuals) if node.left else 0
+        right_gain = self._prune_tree(
+            node.right, residuals) if node.right else 0
 
-        pass
+        # Calculate total gain with this split
+        total_gain = left_gain + right_gain - self.gamma
+
+        # Prune if gain is not sufficient
+        if total_gain < 0:
+            node.left = None
+            node.right = None
+            node.output_val = np.sum(residuals[node.indices]) / \
+                (len(node.indices) + self.lmbda)
+            return 0
+
+        return total_gain
 
     def _build_tree(self, residuals):
         # Randomly select feature to sort by initially
@@ -59,53 +98,67 @@ class XGBoostRegression:
         sorted_indices = np.argsort(self.X[:, rand_i])
 
         # Create root node with sorted indices
-        new_tree = XGBoostNode(indices=sorted_indices.tolist())
+        new_tree = XGBoostNode(similarity=self._calc_similarity_score(
+            residuals), indices=sorted_indices.tolist())
 
-        # Create queue to store nodes to check
-        queue = deque()
-        queue.append(new_tree)
+        # Create queues to store nodes to check
+        current_level_queue = deque()
+        next_level_queue = deque()
 
-        # Iterate until max depth or can't split anymore
-        for i in range(self.max_depth):
-            if len(queue) == 0:
-                break
+        current_level_queue.append(new_tree)
 
-            curr_node = queue.pop()
+        # Iterate until max depth
+        current_depth = 1
+        while current_depth < self.max_depth:
+            while current_level_queue:
+                curr_node = current_level_queue.pop()
 
-            # Randomly select feature to split by
-            rand_i = np.random.randint(0, self.X.shape[1])
+                # Randomly select feature to split by
+                rand_i = np.random.randint(0, self.X.shape[1])
+                curr_node.feature_index = rand_i
 
-            # Split on feature
-            left, right = self._split(residuals, curr_node, rand_i)
+                # Split on feature
+                left, right = self._split(residuals, curr_node, rand_i)
 
-            # Append children to queue if they exist
-            if left and left.output_val is None:
-                queue.append(left)
-            else:
-                left.output_val = residuals[left.indices]/len(left.indices)
+                # Append children to next level queue if they exist
+                if left:
+                    next_level_queue.append(left)
 
-            if right and right.output_val is None:
-                queue.append(right)
-            else:
-                left.output_val = residuals[right.indices]/len(right.indices)
+                if right:
+                    next_level_queue.append(right)
 
-        # we can reach max depth and not set our output values
-        if left and left.output_val is None:
-            queue.append(left)
-        else:
-            left.output_val = residuals[left.indices]/len(left.indices)
+            # Move to the next level
+            current_level_queue, next_level_queue = next_level_queue, deque()
+            current_depth += 1
 
-        if right and right.output_val is None:
-            queue.append(right)
-        else:
-            left.output_val = residuals[right.indices]/len(right.indices)
+        # Process remaining nodes in the next level queue as leaves
+        while current_level_queue:
+            leaf_node = current_level_queue.pop()
+            leaf_node.output_val = np.sum(residuals[leaf_node.indices]) / \
+                (len(leaf_node.indices) + self.lmbda)
+
+        # Post-prune the tree after building
+        self._prune_tree(new_tree, residuals)
 
         return new_tree
 
-    def _calc_residuals(self, y, preds):
-        pass
+    def _traverse_tree(self, tree, data):
+        curr_node = tree
+        while curr_node.output_val == None:
+            if data[curr_node.feature_index] <= curr_node.split_value:
+                curr_node = curr_node.left
+            else:
+                curr_node = curr_node.right
+        return curr_node.output_val
 
     def _split(self, residuals, node, feat_i):
+        # check if we can even split
+        if len(node.indices) <= 1:
+            # set output value
+            node.output_val = np.sum(residuals[node.indices]) / \
+                (len(node.indices) + self.lmbda)
+            return None, None
+
         # Grab the values for the given feature
         vals = self.X[node.indices, feat_i]
         local_residuals = residuals[node.indices]
@@ -143,6 +196,9 @@ class XGBoostRegression:
                 right = XGBoostNode(similarity=right_sim,
                                     parent=node, indices=right_indices)
 
+                # set split value for current node
+                node.split_value = vals[i]
+
         # Update children for root node
         node.left = left
         node.right = right
@@ -162,19 +218,121 @@ class XGBoostRegression:
         return res_sq / n_residuals
 
 
+# Define a simple function to print the tree
+def print_tree(node, depth=0):
+    if node is not None:
+        # Print the current node's details
+        print(" " * 4 * depth +
+              f"Depth {depth}: Node(similarity={node.similarity}, feature_index={node.feature_index}, output_val={node.output_val}, indices={node.indices})")
+
+        # Recursively print the left and right children
+        print_tree(node.left, depth + 1)
+        print_tree(node.right, depth + 1)
+
+
 # Sample Data
-X = np.array([
-    [15, 20, 35], [40, 55, 65], [70, 85, 90], [25, 30, 45]
-])
+X = np.array([[-5], [10], [8], [-3]])
+y = np.array([-10, 6, 7, -7])
 
-# Sample residuals
-residuals = np.array([-10.5, 6.5, 7.5, -7.5])
+# Testing the model
+xgb_model = XGBoostRegression(max_depth=3, n_trees=4, gamma=0, lmbda=0)
+xgb_model.fit(X, y)
+xgb_model.train(X, y)
 
-# Create an instance of the XGBoostTree with a max depth of, say, 3
-xgb_tree = XGBoostRegression(X, max_depth=3)
-xgb_tree.fit(X, 0)
+# Print the structure of each built tree
+for i, tree in enumerate(xgb_model.trees):
+    print(f"\nTree {i}:")
+    print_tree(tree)
 
-# Build the tree
-tree = xgb_tree._build_tree(residuals)
-print(tree.left)
-print(tree.right)
+xgb_model._traverse_tree(xgb_model.trees[0], [-3])
+
+# Test predictions
+predictions = xgb_model.predict(X)
+for data_point, pred in zip(X, predictions):
+    print(f"Prediction for {data_point}: {pred}")
+
+
+# Function to generate synthetic data
+def generate_data(n_samples=100):
+    # Generate random X values
+    X = np.random.uniform(-10, 10, size=(n_samples, 1))
+
+    # Generate y values based on a simple pattern and add some noise
+    y = X[:, 0] * 2 + np.random.normal(0, 2, n_samples)  # y = 2x + noise
+
+    return X, y
+
+
+# Generate data
+X, y = generate_data(n_samples=1000)
+
+xgb_model = XGBoostRegression(max_depth=6, n_trees=10, gamma=20, lmbda=0)
+xgb_model.fit(X, y)
+xgb_model.train(X, y)
+
+
+# Print the structure of each built tree (optional, can be commented out if too verbose)
+# for i, tree in enumerate(xgb_model.trees):
+#     print(f"\nTree {i}:")
+#     print_tree(tree)
+
+# Test predictions
+predictions = xgb_model.predict(X)
+for i in range(10):  # Print predictions for the first 10 data points
+    print(f"Prediction for {X[i]}: {predictions[i]}, Actual: {y[i]}")
+
+
+def mean_squared_error(y_true, y_pred):
+    """
+    Calculate the mean squared error between the true and predicted values.
+
+    :param y_true: Array of true target values.
+    :param y_pred: Array of predicted target values.
+    :return: Mean squared error.
+    """
+    mse = np.mean((y_true - y_pred) ** 2)
+    return mse
+
+
+# Function to perform cross-validation
+
+def cross_val_score(model, X, y, n_splits=5):
+    kf = KFold(n_splits=n_splits)
+    scores = []
+
+    for train_index, test_index in kf.split(X):
+        X_train, X_test = X[train_index], X[test_index]
+        y_train, y_test = y[train_index], y[test_index]
+
+        model.fit(X_train, y_train)
+        model.train(X_train, y_train)
+
+        # Implement a scoring function, e.g., mean squared error
+        predictions = model.predict(X_test)
+        # Define this function as per your requirement
+        score = mean_squared_error(y_test, predictions)
+        scores.append(score)
+
+    return np.mean(scores)
+
+
+# # Grid search
+# gamma_values = [0.1, 0.3, 0.5, 0.7, 1.0]
+# lambda_values = [0.1, 0.3, 0.5, 0.7, 1.0]
+
+# best_score = float('inf')
+# best_params = {}
+
+# for gamma in gamma_values:
+#     for lambda_val in lambda_values:
+#         model = XGBoostRegression(
+#             gamma=gamma, lmbda=lambda_val, max_depth=3, n_trees=10)
+
+#         score = cross_val_score(model, X, y, n_splits=5)
+
+#         if score < best_score:
+#             best_score = score
+#             best_params = {'gamma': gamma, 'lambda': lambda_val}
+
+# print("Best Score:", best_score)
+# print("Best Parameters:", best_params)
