@@ -37,6 +37,10 @@ class XGBoostRegression:
         self.y = y
         self.initial_guess = np.mean(y)
 
+        # Pre-sort indices for each feature
+        self.sorted_indices = [np.argsort(self.X[:, i])
+                               for i in range(self.X.shape[1])]
+
     def predict(self, X):
         # Aggregate predictions from all trees
         predictions = np.full(len(X), self.initial_guess)
@@ -91,21 +95,15 @@ class XGBoostRegression:
         return total_gain
 
     def _build_tree(self, residuals):
-        # Randomly select feature to sort by initially
-        rand_i = np.random.randint(0, self.X.shape[1])
-
-        # Sort indices based on the selected feature
-        sorted_indices = np.argsort(self.X[:, rand_i])
-
         # Create root node with sorted indices
-        new_tree = XGBoostNode(similarity=self._calc_similarity_score(
-            residuals), indices=sorted_indices.tolist())
+        root = XGBoostNode(similarity=self._calc_similarity_score(
+            residuals))
 
         # Create queues to store nodes to check
         current_level_queue = deque()
         next_level_queue = deque()
 
-        current_level_queue.append(new_tree)
+        current_level_queue.append(root)
 
         # Iterate until max depth
         current_depth = 1
@@ -113,19 +111,51 @@ class XGBoostRegression:
             while current_level_queue:
                 curr_node = current_level_queue.pop()
 
-                # Randomly select feature to split by
-                rand_i = np.random.randint(0, self.X.shape[1])
-                curr_node.feature_index = rand_i
+                best_gain = float('-inf')
+                best_feature_index = None
+                best_split = (None, None)
+                best_split_val = None
 
-                # Split on feature
-                left, right = self._split(residuals, curr_node, rand_i)
+                # iterate through each feature
+                for i in np.arange(0, self.X.shape[1]):
+                    curr_node.feature_index = i
+                    sorted_indices = self.sorted_indices[i]
+                    if curr_node != root:
+                        sorted_indices = sorted_indices[np.in1d(
+                            sorted_indices, curr_node.indices)]
+                    curr_node.indices = sorted_indices
+
+                    # Split on feature
+                    split_val, left, right = self._split(
+                        residuals, curr_node, i)
+                    print(split_val)
+
+                    if left and right:
+                        gain = self._calc_gain(
+                            curr_node.similarity, left.similarity, right.similarity)
+
+                        if gain > best_gain:
+                            best_gain = gain
+                            best_split_val = split_val
+                            best_feature_index = i
+                            best_split = (left, right)
 
                 # Append children to next level queue if they exist
-                if left:
-                    next_level_queue.append(left)
+                if best_feature_index:
+                    left = best_split[0]
+                    right = best_split[1]
+                    # Update children for root node
+                    curr_node.left = left
+                    curr_node.right = right
 
-                if right:
+                    curr_node.feature_index = best_feature_index
+                    curr_node.gain = best_gain
+                    curr_node.split_val = best_split_val
+                    next_level_queue.append(left)
                     next_level_queue.append(right)
+                else:  # can't split
+                    curr_node.output_val = np.sum(residuals[curr_node.indices]) / \
+                        (len(curr_node.indices) + self.lmbda)
 
             # Move to the next level
             current_level_queue, next_level_queue = next_level_queue, deque()
@@ -138,9 +168,9 @@ class XGBoostRegression:
                 (len(leaf_node.indices) + self.lmbda)
 
         # Post-prune the tree after building
-        self._prune_tree(new_tree, residuals)
+        self._prune_tree(root, residuals)
 
-        return new_tree
+        return root
 
     def _traverse_tree(self, tree, data):
         curr_node = tree
@@ -162,13 +192,18 @@ class XGBoostRegression:
         # Grab the values for the given feature
         vals = self.X[node.indices, feat_i]
         local_residuals = residuals[node.indices]
+        print(vals.shape)
+        print(local_residuals.shape)
 
         # Get similarity score for root node
         root_sim = node.similarity
 
+        print(root_sim)
+
         best_gain = float('-inf')
         left = None
         right = None
+        best_split_val = None
         # Try the split points for each value
         for i in range(len(vals) - 1):
             # Get split residual values
@@ -185,7 +220,6 @@ class XGBoostRegression:
             # Compare to best gain
             if gain > best_gain:
                 best_gain = gain
-
                 # Extract the indices for left and right nodes from the node's indices
                 left_indices = node.indices[:i + 1]
                 right_indices = node.indices[i + 1:]
@@ -195,15 +229,13 @@ class XGBoostRegression:
                                    parent=node, indices=left_indices)
                 right = XGBoostNode(similarity=right_sim,
                                     parent=node, indices=right_indices)
+                print(left.indices)
+                print(right.indices)
 
                 # set split value for current node
-                node.split_value = vals[i]
+                best_split_val = vals[i]
 
-        # Update children for root node
-        node.left = left
-        node.right = right
-
-        return left, right
+        return best_split_val, left, right
 
     def _calc_gain(self, root_sim, left_sim, right_sim):
         return left_sim + right_sim - root_sim
@@ -238,12 +270,12 @@ y = np.array([-10, 6, 7, -7])
 xgb_model = XGBoostRegression(max_depth=3, n_trees=4, gamma=0, lmbda=0)
 xgb_model.fit(X, y)
 xgb_model.train(X, y)
+print(xgb_model.sorted_indices)
 
 # Print the structure of each built tree
 for i, tree in enumerate(xgb_model.trees):
     print(f"\nTree {i}:")
-    print_tree(tree)
-
+print_tree(tree)
 xgb_model._traverse_tree(xgb_model.trees[0], [-3])
 
 # Test predictions
@@ -252,34 +284,33 @@ for data_point, pred in zip(X, predictions):
     print(f"Prediction for {data_point}: {pred}")
 
 
-# Function to generate synthetic data
-def generate_data(n_samples=100):
-    # Generate random X values
-    X = np.random.uniform(-10, 10, size=(n_samples, 1))
+# Generating a simple dataset for testing
+np.random.seed(0)
 
-    # Generate y values based on a simple pattern and add some noise
-    y = X[:, 0] * 2 + np.random.normal(0, 2, n_samples)  # y = 2x + noise
+# Create 100 samples with 4 features
+X = np.random.randn(100, 4)
 
-    return X, y
+# Define a simple rule for the target variable based on the 4 features
+# These rules create 4 well-defined splits across 4 different features
+y = np.where(X[:, 0] < 0, 1, 0) + \
+    np.where(X[:, 1] > 0.5, 1, 0) + \
+    np.where(X[:, 2] < -0.5, 1, 0) + \
+    np.where(X[:, 3] > 0, 1, 0)
 
-
-# Generate data
-X, y = generate_data(n_samples=1000)
-
-xgb_model = XGBoostRegression(max_depth=6, n_trees=10, gamma=20, lmbda=0)
+# Testing the model
+xgb_model = XGBoostRegression(max_depth=3, n_trees=4, gamma=0, lmbda=0)
 xgb_model.fit(X, y)
 xgb_model.train(X, y)
 
-
-# Print the structure of each built tree (optional, can be commented out if too verbose)
+# Print the structure of each built tree
 # for i, tree in enumerate(xgb_model.trees):
 #     print(f"\nTree {i}:")
-#     print_tree(tree)
+# print_tree(tree)
 
 # Test predictions
 predictions = xgb_model.predict(X)
-for i in range(10):  # Print predictions for the first 10 data points
-    print(f"Prediction for {X[i]}: {predictions[i]}, Actual: {y[i]}")
+for data_point, pred in zip(X, predictions):
+    print(f"Prediction for {data_point}: {pred}")
 
 
 def mean_squared_error(y_true, y_pred):
